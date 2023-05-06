@@ -334,30 +334,44 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 # 使用许多批次来估计任意精度的损失
+# q:@torch.no_grad()
+# a:在PyTorch中，torch.no_grad()是一个上下文管理器，用于禁用梯度计算。
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
+        # 创建一个长度为eval_iters的零张量
         losses = torch.zeros(eval_iters)
+        # 遍历eval_iters 
         for k in range(eval_iters):
+            # 获取批次
             X, Y = get_batch(split)
             with ctx:
+                # 计算模型输出
                 logits, loss = model(X, Y)
+            # 将损失添加到losses中
             losses[k] = loss.item()
+        # 计算平均损失
         out[split] = losses.mean()
+    # 模型训练
     model.train()
+    # 返回out
     return out
 
 # learning rate decay scheduler (cosine with warmup)
+# 学习率衰减调度程序（余弦与热身）
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
+    # 1) warmup_iters步的线性预热
     if it < warmup_iters:
         return learning_rate * it / warmup_iters
     # 2) if it > lr_decay_iters, return min learning rate
+    # 2) 如果it > lr_decay_iters，则返回最小学习率
     if it > lr_decay_iters:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
+    # 3) 在两者之间，使用余弦衰减到最小学习率
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
@@ -379,11 +393,14 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 ## 运行时的 模型 flops 利用率 model flops utilization
 running_mfu = -1.0
+
+## 迭代
 while True:
 
     # determine and set the learning rate for this iteration
     ## 获取学习率
     lr = get_lr(iter_num) if decay_lr else learning_rate
+    ## 设置学习率
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -425,39 +442,63 @@ while True:
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+    # 前向后向更新，可选梯度累积以模拟更大的批量大小
+    # 并使用GradScaler（如果数据类型为float16）
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
+            # 在DDP训练中，我们只需要在最后一个微步中同步梯度。
+            # 官方的方法是使用model.no_sync（）上下文管理器，但是
+            # 我真的不喜欢这样会使代码膨胀，并迫使我们重复代码
+            # 查看该上下文管理器的源代码，它只是切换此变量
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
+            # forward pass
             logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            # 梯度累积
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation # 缩放损失以考虑梯度累积
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        # 在模型在GPU上进行前向传递时立即异步预取下一批
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
+        # 后向传递，如果在fp16中训练，则使用梯度缩放
         scaler.scale(loss).backward()
     # clip the gradient
+    # 裁剪梯度
     if grad_clip != 0.0:
+        # q:以下一行代码的作用是什么？
+        # a:将梯度缩放因子应用于优化器，以便在梯度裁剪之前，梯度缩放因子被取消缩放
         scaler.unscale_(optimizer)
+        # q:以下一行代码的作用是什么？
+        # a:裁剪梯度，以防止梯度爆炸
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
+    # 如果在fp16中训练，则步进优化器和缩放器
     scaler.step(optimizer)
+    # q:以下一行代码的作用是什么？
+    # a:更新缩放器的缩放因子
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
+    # 尽快刷新梯度，不再需要此内存
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
+    # 计时和日志记录
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
+    # 如果是主进程并且到该打印日志的轮次，打印日志
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        # 将损失作为浮点数。 注意：这是CPU-GPU同步点
+        # 缩放以撤消上面的除法，从而近似真实的总损失（精确的总和）
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
+        if local_iter_num >= 5: # let the training loop settle a bit # 让训练循环稳定一点
+            # 估算模型 浮点数 使用率
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
@@ -465,8 +506,10 @@ while True:
     local_iter_num += 1
 
     # termination conditions
+    # 终止条件
     if iter_num > max_iters:
         break
-
+# q:以下一行代码的作用是什么？
+# a:如果是分布式训练，销毁进程组
 if ddp:
     destroy_process_group()
