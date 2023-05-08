@@ -339,6 +339,7 @@ if ddp:
 @torch.no_grad()
 def estimate_loss():
     out = {}
+    # 模型评估模式
     model.eval()
     for split in ['train', 'val']:
         # 创建一个长度为eval_iters的零张量
@@ -354,7 +355,7 @@ def estimate_loss():
             losses[k] = loss.item()
         # 计算平均损失
         out[split] = losses.mean()
-    # 模型训练
+    # 模型训练模式
     model.train()
     # 返回out
     return out

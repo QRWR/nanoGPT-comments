@@ -23,6 +23,7 @@ def new_gelu(x):
     """
     return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
+# 层归一化
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -34,20 +35,28 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+# self attention
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        # 隐藏层维度必须是头数的整数倍,用于多头注意力
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
+        # 在一个batch中，所有头的key, query, value投影
+
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
+        ## 输出的投影矩阵
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
+        # head 数量
         self.n_head = config.n_head
+        # 特征向量
         self.n_embd = config.n_embd
+        # 丢弃
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -61,7 +70,14 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # q:以下代码什么意思？
+        # a:将输入的x进行线性变换，变换成三个矩阵，分别是q,k,v
+        # q:如何进行线性变换的
+        # a:通过self.c_attn进行线性变换
+        # q:过程是什么样的？
+        # a:首先将x进行线性变换，变成三个矩阵，然后将这三个矩阵进行分割，分割成三个矩阵，分别是q,k,v
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # 转换维度,在多头里做矩阵乘法
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -72,17 +88,24 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            # attention 计算
+            # attention score mat(aka att) = scale（q matmul k）
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # mask att = mask（att）decode-only
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # softmax(mask att) 最后一维度进行softmax
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        # concat all head outputs back together
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+# FFN
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -142,11 +165,20 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
+
+        # 当使用Torch.compile()时，在重量捆绑方面会产生一些警告：
+        # “UserWarning：functional_call为绑定的权重传递了多个值。
+        # 这种行为已被弃用，并将在将来的版本中成为错误”
+        # 不100％确定这是什么，到目前为止似乎是无害的。 TODO调查
+
+        # 共享了权重
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
+        # 初始化所有权重
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
+        # 对残差投影应用特殊的缩放初始化，每个GPT-2论文
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
@@ -161,14 +193,18 @@ class GPT(nn.Module):
         The token embeddings would too, except due to the parameter sharing these
         params are actually used as weights in the final layer, so we include them.
         """
+        # 返回模型中的参数数量。
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
+        # 如果是线性层
         if isinstance(module, nn.Linear):
+            # 使用正态分布初始化权重    mean=0.0, std=0.02
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # 如果有偏置
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -190,11 +226,14 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            # 如果我们给出了一些期望的目标，还要计算损失
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # 推理时的小优化：只在最后一个位置上前向lm_head
+
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim # 注意：使用列表[-1]来保留时间维度
             loss = None
 
         return logits, loss
@@ -348,22 +387,30 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        # 遍历max_new_tokens次
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
+            # 如果序列太长，我们必须在block_size处裁剪它
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
+            # 前向模型以获得序列中索引的logits
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
+            # 最后一步的
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
+            # 可选地将logits裁剪为仅包含前k个选项
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
+            # 应用softmax将logits转换为（归一化）概率
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
+            # 从分布中采样
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
+            # 将采样的索引附加到运行序列并继续
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
